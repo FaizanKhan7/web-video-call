@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import Peer from "peerjs";
 import {
   Video, VideoOff, Mic, MicOff, MonitorUp, MonitorX,
-  PhoneOff, Copy, Check, Users, Radio, Volume2, VolumeX,
+  PhoneOff, Copy, Check, Users, Radio, Volume2, VolumeX, Maximize2,
 } from "lucide-react";
 
 /* ─────────────────────────────────────────────────────────
@@ -37,6 +37,8 @@ export default function OpenLine() {
   const [notice, setNotice] = useState("");
   const [mediaReady, setMediaReady] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [shareSupported, setShareSupported] = useState(true);
+  const [shareError, setShareError] = useState("");
 
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
@@ -53,10 +55,27 @@ export default function OpenLine() {
   /* ── local media ─────────────────────────────────────── */
 
   useEffect(() => {
+    const md = navigator.mediaDevices;
+    setShareSupported(!!(md && typeof md.getDisplayMedia === "function"));
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 },
+            facingMode: "user",
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
         if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
         localStreamRef.current = stream;
         setMediaReady(true);
@@ -90,6 +109,26 @@ export default function OpenLine() {
     return local;
   };
 
+  const tuneSenderBitrate = (call) => {
+    const pc = call?.peerConnection;
+    if (!pc) return;
+    pc.getSenders().forEach(async (sender) => {
+      if (!sender.track) return;
+      try {
+        const params = sender.getParameters();
+        if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+        const maxKbps = sender.track.kind === "video"
+          ? (screenStreamRef.current ? 2_500_000 : 1_500_000)
+          : 96_000;
+        params.encodings.forEach((enc) => { enc.maxBitrate = maxKbps; });
+        if (sender.track.kind === "video") {
+          params.degradationPreference = "maintain-framerate";
+        }
+        await sender.setParameters(params);
+      } catch {}
+    });
+  };
+
   const wireCall = (call, peerName) => {
     callsRef.current[call.peer] = call;
     call.on("stream", (stream) => {
@@ -97,6 +136,7 @@ export default function OpenLine() {
         ...prev,
         [call.peer]: { name: prev[call.peer]?.name || peerName || "Guest", stream },
       }));
+      tuneSenderBitrate(call);
     });
     call.on("close", () => dropRemote(call.peer));
     call.on("error", () => dropRemote(call.peer));
@@ -332,19 +372,37 @@ export default function OpenLine() {
       if (!pc) return;
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
       if (sender) sender.replaceTrack(newTrack);
+      tuneSenderBitrate(call);
     });
   };
 
   const startShare = async () => {
+    setShareError("");
+    const md = navigator.mediaDevices;
+    if (!md || typeof md.getDisplayMedia !== "function") {
+      setShareSupported(false);
+      setShareError("Screen sharing isn't supported on this browser. Try Chrome on desktop or Android 12+.");
+      return;
+    }
     try {
-      const screen = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const screen = await md.getDisplayMedia({ video: true, audio: false });
       screenStreamRef.current = screen;
       const track = screen.getVideoTracks()[0];
+      if (!track) throw new Error("No video track");
       swapOutgoingVideo(track);
       if (localVideoRef.current) localVideoRef.current.srcObject = screen;
       setSharing(true);
       track.onended = stopShare;
-    } catch {}
+    } catch (err) {
+      const name = err?.name || "";
+      if (name === "NotAllowedError") setShareError("Screen share was cancelled or blocked.");
+      else if (name === "NotSupportedError" || name === "TypeError") {
+        setShareSupported(false);
+        setShareError("Screen sharing isn't supported on this browser.");
+      }
+      else if (name === "NotReadableError") setShareError("Your screen couldn't be captured. Another app may be using it.");
+      else setShareError("Couldn't start screen share. " + (err?.message || ""));
+    }
   };
 
   const stopShare = () => {
@@ -442,6 +500,10 @@ export default function OpenLine() {
             <div className={`tile ${sharing ? "is-sharing" : ""}`}>
               <video ref={localVideoRef} autoPlay playsInline muted className={sharing ? "fit-contain" : ""} />
               {!camOn && !sharing && <div className="tile-off"><VideoOff size={28} /></div>}
+              <button className="tile-fullscreen" aria-label="View fullscreen"
+                onClick={() => enterFullscreen(localVideoRef.current)}>
+                <Maximize2 size={16} />
+              </button>
               <span className="tile-name">
                 {nameRef.current || "You"} (you)
                 {!micOn && <MicOff size={12} className="name-icon" />}
@@ -472,6 +534,13 @@ export default function OpenLine() {
             )}
           </main>
 
+          {shareError && (
+            <div className="call-toast" role="status" onClick={() => setShareError("")}>
+              {shareError}
+              <span className="toast-close">Dismiss</span>
+            </div>
+          )}
+
           <footer className="controls">
             <button className={`ctl ${micOn ? "" : "off"}`} onClick={toggleMic}
               aria-label={micOn ? "Mute microphone" : "Unmute microphone"}>
@@ -488,7 +557,8 @@ export default function OpenLine() {
               {camOn ? <Video size={20} /> : <VideoOff size={20} />}
               <span className="ctl-label">{camOn ? "Camera off" : "Camera on"}</span>
             </button>
-            <button className={`ctl ${sharing ? "active" : ""}`} onClick={sharing ? stopShare : startShare}
+            <button className={`ctl ${sharing ? "active" : ""} ${shareSupported ? "" : "off"}`}
+              onClick={sharing ? stopShare : startShare}
               aria-label={sharing ? "Stop sharing screen" : "Share screen"}>
               {sharing ? <MonitorX size={20} /> : <MonitorUp size={20} />}
               <span className="ctl-label">{sharing ? "Stop share" : "Share screen"}</span>
@@ -504,10 +574,28 @@ export default function OpenLine() {
   );
 }
 
+function enterFullscreen(el) {
+  if (!el) return;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitEnterFullscreen;
+  if (req) { try { req.call(el); return; } catch {} }
+  // iOS Safari fallback on the <video> element itself
+  if (typeof el.webkitEnterFullscreen === "function") {
+    try { el.webkitEnterFullscreen(); } catch {}
+  }
+}
+
 function PeerVideo({ stream, muted }) {
   const ref = useRef(null);
   useEffect(() => { if (ref.current) ref.current.srcObject = stream; }, [stream]);
-  return <video ref={ref} autoPlay playsInline muted={muted} />;
+  return (
+    <>
+      <video ref={ref} autoPlay playsInline muted={muted} />
+      <button className="tile-fullscreen" aria-label="View fullscreen"
+        onClick={() => enterFullscreen(ref.current)}>
+        <Maximize2 size={16} />
+      </button>
+    </>
+  );
 }
 
 /* ── styles ──────────────────────────────────────────────── */
@@ -631,6 +719,19 @@ const css = `
 .tile video { width: 100%; height: 100%; object-fit: cover; }
 .tile video.fit-contain { object-fit: contain; background: #000; }
 .tile.is-sharing { border-color: var(--amber); }
+.tile-fullscreen {
+  position: absolute; top: 10px; right: 10px;
+  width: 32px; height: 32px; border-radius: 50%;
+  background: rgba(13,17,23,0.72); border: 1px solid rgba(233,238,245,0.15);
+  color: var(--text); display: grid; place-items: center;
+  opacity: 0; transition: opacity 120ms ease;
+}
+.tile:hover .tile-fullscreen,
+.tile:focus-within .tile-fullscreen { opacity: 1; }
+@media (hover: none) { .tile-fullscreen { opacity: 1; } }
+video:fullscreen, video:-webkit-full-screen {
+  width: 100vw; height: 100vh; object-fit: contain; background: #000;
+}
 .tile-off {
   position: absolute; inset: 0; display: grid; place-items: center;
   color: var(--muted); background: var(--panel);
@@ -648,6 +749,15 @@ const css = `
 .waiting-title { font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700; font-size: 18px; margin: 0; }
 .waiting-sub { color: var(--muted); font-size: 14px; margin: 0; }
 .waiting-sub strong { color: var(--amber); letter-spacing: 0.12em; }
+
+.call-toast {
+  margin: 0 20px 4px; padding: 10px 14px;
+  background: rgba(228, 96, 77, 0.14); border: 1px solid rgba(228, 96, 77, 0.4);
+  color: var(--text); border-radius: 10px; font-size: 13px; line-height: 1.4;
+  display: flex; justify-content: space-between; gap: 12px; align-items: center;
+  cursor: pointer;
+}
+.toast-close { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
 
 .controls {
   display: flex; justify-content: center; gap: 12px; padding: 16px 20px 22px;
