@@ -124,16 +124,19 @@ export default function OpenLine() {
 
   const broadcastRoster = () => {
     if (!isHostRef.current) return;
+    const hostId = peerRef.current.id;
     const roster = {
-      [peerRef.current.id]: nameRef.current,
+      [hostId]: nameRef.current,
       ...rosterRef.current,
     };
-    // Update our local view of peer names
+    // Show every guest in local peers state (placeholder until their stream arrives)
     setPeers((prev) => {
       const next = { ...prev };
       Object.entries(roster).forEach(([id, n]) => {
-        if (id !== peerRef.current.id && next[id]) next[id] = { ...next[id], name: n };
+        if (id === hostId) return;
+        next[id] = { name: n, stream: next[id]?.stream || null };
       });
+      Object.keys(next).forEach((id) => { if (!(id in roster)) delete next[id]; });
       return next;
     });
     Object.values(dataConnsRef.current).forEach((conn) => {
@@ -143,6 +146,7 @@ export default function OpenLine() {
 
   const applyRosterAsGuest = (roster) => {
     const me = peerRef.current?.id;
+    const hostId = hostIdFor(roomRef.current);
     // Update names for known peers, add placeholders for new ones
     setPeers((prev) => {
       const next = { ...prev };
@@ -150,16 +154,15 @@ export default function OpenLine() {
         if (id === me) return;
         next[id] = { name: n, stream: next[id]?.stream || null };
       });
-      // Drop peers no longer in roster
       Object.keys(next).forEach((id) => { if (!(id in roster)) delete next[id]; });
       return next;
     });
-    // Dial peers whose id sorts lower than mine (deterministic pair direction)
+    // Direction rules: host always dials guests (handled host-side).
+    // Guests dial each other with deterministic direction (id > mine), and never dial the host.
     Object.entries(roster).forEach(([id, n]) => {
-      if (id === me) return;
-      if (id < me && !callsRef.current[id]) dialPeer(id, n);
+      if (id === me || id === hostId) return;
+      if (id > me && !callsRef.current[id]) dialPeer(id, n);
     });
-    // Drop calls for peers that left
     Object.keys(callsRef.current).forEach((id) => {
       if (!(id in roster)) dropRemote(id);
     });
@@ -183,8 +186,11 @@ export default function OpenLine() {
         conn.on("data", (msg) => {
           if (!msg || typeof msg !== "object") return;
           if (msg.type === "hello" && isHostRef.current) {
-            rosterRef.current[conn.peer] = msg.name || "Guest";
+            const guestName = msg.name || "Guest";
+            rosterRef.current[conn.peer] = guestName;
             broadcastRoster();
+            // Host proactively dials the new guest so the direction is deterministic
+            dialPeer(conn.peer, guestName);
           }
         });
         conn.on("close", () => { dropRemote(conn.peer); });
