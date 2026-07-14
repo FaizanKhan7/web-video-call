@@ -1,51 +1,34 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
+import Peer from "peerjs";
 import {
   Video, VideoOff, Mic, MicOff, MonitorUp, MonitorX,
   PhoneOff, Copy, Check, Users, Radio, Volume2, VolumeX,
 } from "lucide-react";
 
 /* ─────────────────────────────────────────────────────────
-   OpenLine — peer-to-peer video calls
-   Signaling rides on shared artifact storage (polled),
-   media flows directly between browsers via WebRTC.
+   OpenLine — peer-to-peer video calls via PeerJS.
+   Signaling uses PeerJS's public broker (0.peerjs.com).
+   First person to enter a room claims the host peer ID
+   `openline-<ROOMCODE>` and maintains the roster; guests
+   dial the host, receive the roster, then media-call every
+   other peer directly. Screen sharing swaps the outgoing
+   video track on each active call.
    ───────────────────────────────────────────────────────── */
 
-const PREFIX = "openline-room";
-const ICE_SERVERS = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const HOST_PREFIX = "openline-";
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 const makeCode = () =>
   Array.from({ length: 6 }, () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join("");
-const makeId = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 
-const waitForIce = (pc) =>
-  new Promise((resolve) => {
-    if (pc.iceGatheringState === "complete") return resolve();
-    const timer = setTimeout(resolve, 2500);
-    pc.addEventListener("icegatheringstatechange", () => {
-      if (pc.iceGatheringState === "complete") { clearTimeout(timer); resolve(); }
-    });
-  });
-
-const sGet = async (key) => {
-  try { const r = await window.storage.get(key, true); return r ? JSON.parse(r.value) : null; }
-  catch { return null; }
-};
-const sSet = async (key, value) => {
-  try { await window.storage.set(key, JSON.stringify(value), true); } catch {}
-};
-const sDel = async (key) => { try { await window.storage.delete(key, true); } catch {} };
-const sList = async (prefix) => {
-  try { const r = await window.storage.list(prefix, true); return r ? r.keys : []; }
-  catch { return []; }
-};
+const hostIdFor = (room) => `${HOST_PREFIX}${room.toLowerCase()}`;
 
 export default function OpenLine() {
-  const [stage, setStage] = useState("lobby");          // lobby | call
+  const [stage, setStage] = useState("lobby");
   const [name, setName] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [roomCode, setRoomCode] = useState("");
-  const [peers, setPeers] = useState({});               // id -> { name, stream }
+  const [peers, setPeers] = useState({});           // peerId -> { name, stream }
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
   const [audioMuted, setAudioMuted] = useState(false);
@@ -53,22 +36,19 @@ export default function OpenLine() {
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState("");
   const [mediaReady, setMediaReady] = useState(false);
+  const [connecting, setConnecting] = useState(false);
 
-  const myIdRef = useRef(makeId());
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
-  const pcsRef = useRef({});                            // peerId -> RTCPeerConnection
-  const handledOffersRef = useRef(new Set());
-  const pendingAnswersRef = useRef(new Set());          // peerIds I offered to, awaiting answer
-  const pollRef = useRef(null);
-  const roomRef = useRef("");
+  const peerRef = useRef(null);                     // PeerJS instance
+  const callsRef = useRef({});                      // peerId -> MediaConnection
+  const dataConnsRef = useRef({});                  // peerId -> DataConnection (host: to each guest; guest: to host only)
+  const rosterRef = useRef({});                     // host-authoritative peerId -> name
+  const isHostRef = useRef(false);
   const nameRef = useRef("");
+  const roomRef = useRef("");
   const localVideoRef = useRef(null);
   const lobbyVideoRef = useRef(null);
-
-  const keyPeers = (room) => `${PREFIX}:${room}:peers`;
-  const keyOffer = (room, from, to) => `${PREFIX}:${room}:offer:${from}:${to}`;
-  const keyAnswer = (room, from, to) => `${PREFIX}:${room}:answer:${from}:${to}`;
 
   /* ── local media ─────────────────────────────────────── */
 
@@ -95,119 +75,126 @@ export default function OpenLine() {
       localVideoRef.current.srcObject = localStreamRef.current;
   }, [stage, mediaReady]);
 
-  /* ── peer connection plumbing ────────────────────────── */
+  /* ── peer helpers ────────────────────────────────────── */
 
-  const attachLocalTracks = (pc) => {
-    const stream = localStreamRef.current;
-    if (!stream) return;
-    stream.getTracks().forEach((track) => {
-      // If screen sharing, send the screen video instead of the camera
-      if (track.kind === "video" && screenStreamRef.current) {
-        pc.addTrack(screenStreamRef.current.getVideoTracks()[0], stream);
-      } else {
-        pc.addTrack(track, stream);
-      }
+  const outgoingStreamForCall = () => {
+    // If sharing, send screen video + mic audio; else camera+mic
+    const local = localStreamRef.current;
+    if (!local) return null;
+    if (screenStreamRef.current) {
+      const combined = new MediaStream();
+      screenStreamRef.current.getVideoTracks().forEach((t) => combined.addTrack(t));
+      local.getAudioTracks().forEach((t) => combined.addTrack(t));
+      return combined;
+    }
+    return local;
+  };
+
+  const wireCall = (call, peerName) => {
+    callsRef.current[call.peer] = call;
+    call.on("stream", (stream) => {
+      setPeers((prev) => ({
+        ...prev,
+        [call.peer]: { name: prev[call.peer]?.name || peerName || "Guest", stream },
+      }));
     });
+    call.on("close", () => dropRemote(call.peer));
+    call.on("error", () => dropRemote(call.peer));
   };
 
-  const buildPc = (peerId, peerName) => {
-    const pc = new RTCPeerConnection(ICE_SERVERS);
-    attachLocalTracks(pc);
-    pc.ontrack = (e) => {
-      const stream = e.streams[0];
-      setPeers((prev) => ({ ...prev, [peerId]: { name: prev[peerId]?.name || peerName || "Guest", stream } }));
-    };
-    pc.onconnectionstatechange = () => {
-      if (["failed", "closed"].includes(pc.connectionState)) dropPeer(peerId);
-    };
-    pcsRef.current[peerId] = pc;
-    return pc;
-  };
-
-  const dropPeer = (peerId) => {
-    const pc = pcsRef.current[peerId];
-    if (pc) { try { pc.close(); } catch {} delete pcsRef.current[peerId]; }
-    pendingAnswersRef.current.delete(peerId);
+  const dropRemote = (peerId) => {
+    const call = callsRef.current[peerId];
+    if (call) { try { call.close(); } catch {} delete callsRef.current[peerId]; }
+    const conn = dataConnsRef.current[peerId];
+    if (conn) { try { conn.close(); } catch {} delete dataConnsRef.current[peerId]; }
+    if (isHostRef.current && rosterRef.current[peerId]) {
+      delete rosterRef.current[peerId];
+      broadcastRoster();
+    }
     setPeers((prev) => { const next = { ...prev }; delete next[peerId]; return next; });
   };
 
-  const sendOfferTo = async (peerId, peerName) => {
-    const room = roomRef.current;
-    const pc = buildPc(peerId, peerName);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await waitForIce(pc);
-    await sSet(keyOffer(room, myIdRef.current, peerId), {
-      sdp: pc.localDescription.sdp, type: pc.localDescription.type, name: nameRef.current,
-    });
-    pendingAnswersRef.current.add(peerId);
+  const dialPeer = (remoteId, remoteName) => {
+    if (callsRef.current[remoteId]) return;
+    const stream = outgoingStreamForCall();
+    if (!stream || !peerRef.current) return;
+    const call = peerRef.current.call(remoteId, stream, { metadata: { name: nameRef.current } });
+    if (call) wireCall(call, remoteName);
   };
 
-  const answerOffer = async (peerId, payload) => {
-    const room = roomRef.current;
-    const pc = buildPc(peerId, payload.name);
-    await pc.setRemoteDescription({ type: payload.type, sdp: payload.sdp });
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await waitForIce(pc);
-    await sSet(keyAnswer(room, myIdRef.current, peerId), {
-      sdp: pc.localDescription.sdp, type: pc.localDescription.type, name: nameRef.current,
+  const broadcastRoster = () => {
+    if (!isHostRef.current) return;
+    const roster = {
+      [peerRef.current.id]: nameRef.current,
+      ...rosterRef.current,
+    };
+    // Update our local view of peer names
+    setPeers((prev) => {
+      const next = { ...prev };
+      Object.entries(roster).forEach(([id, n]) => {
+        if (id !== peerRef.current.id && next[id]) next[id] = { ...next[id], name: n };
+      });
+      return next;
+    });
+    Object.values(dataConnsRef.current).forEach((conn) => {
+      try { conn.send({ type: "roster", roster }); } catch {}
     });
   };
 
-  /* ── signaling poll loop ─────────────────────────────── */
-
-  const pollSignals = useCallback(async () => {
-    const room = roomRef.current;
-    const me = myIdRef.current;
-    if (!room) return;
-
-    // 1. Roster: connect to newcomers, clean up leavers
-    const roster = (await sGet(keyPeers(room))) || [];
-    const rosterIds = new Set(roster.map((p) => p.id));
-    for (const p of roster) {
-      if (p.id === me) continue;
-      const connected = !!pcsRef.current[p.id];
-      const awaiting = pendingAnswersRef.current.has(p.id);
-      // Deterministic direction: higher id makes the offer
-      if (!connected && !awaiting && me > p.id) {
-        try { await sendOfferTo(p.id, p.name); } catch {}
-      }
-      setPeers((prev) => prev[p.id] && prev[p.id].name !== p.name
-        ? { ...prev, [p.id]: { ...prev[p.id], name: p.name } } : prev);
-    }
-    Object.keys(pcsRef.current).forEach((id) => { if (!rosterIds.has(id)) dropPeer(id); });
-
-    // 2. Offers addressed to me
-    const offerKeys = await sList(`${PREFIX}:${room}:offer:`);
-    for (const key of offerKeys) {
-      if (!key.endsWith(`:${me}`)) continue;
-      if (handledOffersRef.current.has(key)) continue;
-      const from = key.split(":")[3];
-      if (pcsRef.current[from]) { handledOffersRef.current.add(key); continue; }
-      const payload = await sGet(key);
-      if (!payload) continue;
-      handledOffersRef.current.add(key);
-      try { await answerOffer(from, payload); } catch {}
-    }
-
-    // 3. Answers to my offers
-    for (const peerId of [...pendingAnswersRef.current]) {
-      const payload = await sGet(keyAnswer(room, peerId, me));
-      if (!payload) continue;
-      const pc = pcsRef.current[peerId];
-      if (pc && pc.signalingState === "have-local-offer") {
-        try {
-          await pc.setRemoteDescription({ type: payload.type, sdp: payload.sdp });
-          setPeers((prev) => ({ ...prev, [peerId]: { name: payload.name, stream: prev[peerId]?.stream || null } }));
-        } catch {}
-      }
-      pendingAnswersRef.current.delete(peerId);
-      sDel(keyAnswer(room, peerId, me));
-    }
-  }, []);
+  const applyRosterAsGuest = (roster) => {
+    const me = peerRef.current?.id;
+    // Update names for known peers, add placeholders for new ones
+    setPeers((prev) => {
+      const next = { ...prev };
+      Object.entries(roster).forEach(([id, n]) => {
+        if (id === me) return;
+        next[id] = { name: n, stream: next[id]?.stream || null };
+      });
+      // Drop peers no longer in roster
+      Object.keys(next).forEach((id) => { if (!(id in roster)) delete next[id]; });
+      return next;
+    });
+    // Dial peers whose id sorts lower than mine (deterministic pair direction)
+    Object.entries(roster).forEach(([id, n]) => {
+      if (id === me) return;
+      if (id < me && !callsRef.current[id]) dialPeer(id, n);
+    });
+    // Drop calls for peers that left
+    Object.keys(callsRef.current).forEach((id) => {
+      if (!(id in roster)) dropRemote(id);
+    });
+  };
 
   /* ── join / leave ────────────────────────────────────── */
+
+  const attachIncoming = (peer) => {
+    peer.on("call", (call) => {
+      const stream = outgoingStreamForCall();
+      if (!stream) return;
+      call.answer(stream);
+      const remoteName = call.metadata?.name || "Guest";
+      wireCall(call, remoteName);
+    });
+
+    peer.on("connection", (conn) => {
+      // Only meaningful for host — a guest opening its data channel
+      conn.on("open", () => {
+        dataConnsRef.current[conn.peer] = conn;
+        conn.on("data", (msg) => {
+          if (!msg || typeof msg !== "object") return;
+          if (msg.type === "hello" && isHostRef.current) {
+            rosterRef.current[conn.peer] = msg.name || "Guest";
+            broadcastRoster();
+          }
+        });
+        conn.on("close", () => { dropRemote(conn.peer); });
+      });
+    });
+
+    peer.on("disconnected", () => {
+      try { peer.reconnect(); } catch {}
+    });
+  };
 
   const enterRoom = async (code) => {
     if (!localStreamRef.current) {
@@ -215,49 +202,111 @@ export default function OpenLine() {
       return;
     }
     const room = code.toUpperCase().trim();
+    if (room.length !== 6) return;
     roomRef.current = room;
     nameRef.current = name.trim() || "Guest";
     setRoomCode(room);
     setNotice("");
+    setConnecting(true);
 
-    const roster = (await sGet(keyPeers(room))) || [];
-    const cleaned = roster.filter((p) => p.id !== myIdRef.current);
-    cleaned.push({ id: myIdRef.current, name: nameRef.current });
-    await sSet(keyPeers(room), cleaned);
+    const wantedHostId = hostIdFor(room);
 
+    // Try to claim the host slot first
+    let peer = new Peer(wantedHostId, { debug: 0 });
+    let asHost = true;
+
+    const openOrFail = () =>
+      new Promise((resolve, reject) => {
+        const onOpen = () => { peer.off("error", onError); resolve(); };
+        const onError = (err) => { peer.off("open", onOpen); reject(err); };
+        peer.once("open", onOpen);
+        peer.once("error", onError);
+      });
+
+    try {
+      await openOrFail();
+    } catch (err) {
+      // Host slot taken (or other issue). Retry as guest with random ID.
+      try { peer.destroy(); } catch {}
+      if (err?.type && err.type !== "unavailable-id") {
+        setConnecting(false);
+        setNotice("Couldn't reach the signaling service. Check your connection and try again.");
+        return;
+      }
+      asHost = false;
+      peer = new Peer({ debug: 0 });
+      try {
+        await new Promise((resolve, reject) => {
+          peer.once("open", resolve);
+          peer.once("error", reject);
+        });
+      } catch {
+        try { peer.destroy(); } catch {}
+        setConnecting(false);
+        setNotice("Couldn't reach the signaling service. Check your connection and try again.");
+        return;
+      }
+    }
+
+    peerRef.current = peer;
+    isHostRef.current = asHost;
+    rosterRef.current = {};
+    attachIncoming(peer);
+
+    if (!asHost) {
+      // Dial the host's data channel and identify ourselves
+      const conn = peer.connect(wantedHostId, { reliable: true, metadata: { name: nameRef.current } });
+      dataConnsRef.current[wantedHostId] = conn;
+      conn.on("open", () => {
+        try { conn.send({ type: "hello", name: nameRef.current }); } catch {}
+      });
+      conn.on("data", (msg) => {
+        if (msg?.type === "roster") applyRosterAsGuest(msg.roster);
+      });
+      conn.on("close", () => {
+        // Host left — end the call for this guest
+        setNotice("The host ended the call.");
+        leaveRoom();
+      });
+      conn.on("error", () => {});
+    }
+
+    setConnecting(false);
     setStage("call");
-    pollSignals();
-    pollRef.current = setInterval(pollSignals, 1600);
   };
 
-  const leaveRoom = async () => {
-    const room = roomRef.current;
-    const me = myIdRef.current;
-    if (pollRef.current) clearInterval(pollRef.current);
-    Object.keys(pcsRef.current).forEach(dropPeer);
-    handledOffersRef.current.clear();
-    pendingAnswersRef.current.clear();
+  const leaveRoom = () => {
+    // Close all calls and data connections
+    Object.keys(callsRef.current).forEach((id) => {
+      try { callsRef.current[id].close(); } catch {}
+    });
+    callsRef.current = {};
+    Object.keys(dataConnsRef.current).forEach((id) => {
+      try { dataConnsRef.current[id].close(); } catch {}
+    });
+    dataConnsRef.current = {};
+
+    if (peerRef.current) {
+      try { peerRef.current.destroy(); } catch {}
+      peerRef.current = null;
+    }
 
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach((t) => t.stop());
       screenStreamRef.current = null;
       setSharing(false);
     }
-    if (room) {
-      const roster = (await sGet(keyPeers(room))) || [];
-      await sSet(keyPeers(room), roster.filter((p) => p.id !== me));
-      const keys = await sList(`${PREFIX}:${room}:`);
-      for (const k of keys) {
-        const parts = k.split(":");
-        if (parts[3] === me || parts[4] === me) sDel(k);
-      }
-    }
+
+    rosterRef.current = {};
+    isHostRef.current = false;
     roomRef.current = "";
     setPeers({});
     setStage("lobby");
   };
 
-  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+  useEffect(() => () => {
+    if (peerRef.current) { try { peerRef.current.destroy(); } catch {} }
+  }, []);
 
   /* ── controls ────────────────────────────────────────── */
 
@@ -272,7 +321,9 @@ export default function OpenLine() {
   };
 
   const swapOutgoingVideo = (newTrack) => {
-    Object.values(pcsRef.current).forEach((pc) => {
+    Object.values(callsRef.current).forEach((call) => {
+      const pc = call.peerConnection;
+      if (!pc) return;
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
       if (sender) sender.replaceTrack(newTrack);
     });
@@ -339,8 +390,8 @@ export default function OpenLine() {
                 value={name} onChange={(e) => setName(e.target.value)}
               />
 
-              <button className="btn primary" onClick={() => enterRoom(makeCode())} disabled={!mediaReady}>
-                Start a new call
+              <button className="btn primary" onClick={() => enterRoom(makeCode())} disabled={!mediaReady || connecting}>
+                {connecting ? "Connecting…" : "Start a new call"}
               </button>
 
               <div className="divider"><span>or join one</span></div>
@@ -352,9 +403,9 @@ export default function OpenLine() {
                   onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
                   onKeyDown={(e) => { if (e.key === "Enter" && joinCode.length === 6) enterRoom(joinCode); }}
                 />
-                <button className="btn ghost" disabled={joinCode.length !== 6 || !mediaReady}
+                <button className="btn ghost" disabled={joinCode.length !== 6 || !mediaReady || connecting}
                   onClick={() => enterRoom(joinCode)}>
-                  Join
+                  {connecting ? "…" : "Join"}
                 </button>
               </div>
 
@@ -488,6 +539,7 @@ const css = `
 }
 .wordmark svg { color: var(--amber); }
 .wordmark.small { font-size: 15px; }
+.wordmark.plain svg { display: none; }
 
 /* ── lobby ── */
 .lobby { max-width: 960px; width: 100%; margin: 0 auto; padding: 48px 24px 64px; }
@@ -520,7 +572,7 @@ const css = `
   background: var(--ink); border: 1px solid var(--line); color: var(--text);
   border-radius: 9px; padding: 11px 13px; font-size: 15px; width: 100%;
 }
-.text-input::placeholder { color: #55617233; color: #5A6678; }
+.text-input::placeholder { color: #5A6678; }
 .code-input {
   font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700;
   letter-spacing: 0.32em; text-transform: uppercase; font-size: 17px;
@@ -548,7 +600,7 @@ const css = `
 .fineprint { color: var(--muted); font-size: 12px; line-height: 1.55; margin: 4px 0 0; }
 
 /* ── call ── */
-.call { flex: 1; display: flex; flex-direction: column; min-height: 100vh; }
+.call { flex: 1; display: flex; flex-direction: column; min-height: 100vh; min-height: 100dvh; }
 .call-head {
   display: flex; align-items: center; justify-content: space-between; gap: 16px;
   padding: 14px 20px; border-bottom: 1px solid var(--line);
@@ -593,7 +645,7 @@ const css = `
 
 .controls {
   display: flex; justify-content: center; gap: 12px; padding: 16px 20px 22px;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--line); flex-wrap: wrap;
 }
 .ctl {
   min-height: 52px; padding: 8px 16px; border-radius: 26px; border: 1px solid var(--line);
@@ -610,17 +662,8 @@ const css = `
 .ctl.leave:hover:not(:disabled) { background: #c8523f; }
 .ctl-label { white-space: nowrap; }
 
-@media (max-width: 520px) {
-  .controls { gap: 8px; padding: 12px 10px 16px; flex-wrap: wrap; }
-  .ctl { padding: 8px 12px; font-size: 12px; }
-  .ctl-label { display: none; }
-  .ctl { min-width: 48px; justify-content: center; }
-}
-
 @media (max-width: 720px) {
-  .call-head {
-    flex-wrap: wrap; gap: 10px; padding: 12px 14px;
-  }
+  .call-head { flex-wrap: wrap; gap: 10px; padding: 12px 14px; }
   .room-sign { order: 3; width: 100%; justify-content: center; }
   .sign-cell { width: 26px; height: 32px; font-size: 15px; }
   .head-right { margin-left: auto; }
@@ -629,6 +672,11 @@ const css = `
   .lobby { padding: 28px 16px 48px; }
   .lobby-head { margin-bottom: 24px; }
   .lobby-panel { padding: 18px; }
+}
+@media (max-width: 520px) {
+  .controls { gap: 8px; padding: 12px 10px 16px; }
+  .ctl { padding: 8px 12px; font-size: 12px; min-width: 48px; justify-content: center; }
+  .ctl-label { display: none; }
 }
 @media (max-width: 420px) {
   .sign-cell { width: 22px; height: 28px; font-size: 13px; border-radius: 5px; }
